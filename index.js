@@ -226,118 +226,43 @@ async function startBot() {
   const suppressedLogger = createSuppressedLogger('silent');
 
   const sock = makeWASocket({
-    version, // explicit WA Web version negotiated with the server
+    version,
     logger: suppressedLogger,
-    printQRInTerminal: false, // ✅ DISABLED QR - PAIRING CODE ONLY
-    // Use a common desktop browser signature
+    printQRInTerminal: true, // Temporarily allow QR as fallback
     browser: ['Chrome', 'Windows', '10.0'],
     auth: state,
-    // Memory optimization: prevent loading old messages into RAM
     syncFullHistory: false,
     downloadHistory: false,
     markOnlineOnConnect: false,
-    getMessage: async () => undefined // Don't load messages from store
+    getMessage: async () => undefined
   });
-
-  // ✅ PAIRING CODE LOGIC - ADDED HERE
-  // Request pairing code if not registered yet
-  if (!state.creds.registered) {
-    console.log('\n📱 Requesting pairing code...');
-    // Get phone number from environment variable or config
-    const phoneNumber = process.env.OWNER_NUMBER || config.ownerNumber || '6281234567890';
-    
-    try {
-      const code = await sock.requestPairingCode(phoneNumber);
-      console.log('\n🔐 ========================================');
-      console.log(`🔐 YOUR PAIRING CODE: ${code}`);
-      console.log('🔐 ========================================');
-      console.log('\n📲 To link your WhatsApp:');
-      console.log('1. Open WhatsApp on your phone');
-      console.log('2. Go to Settings → Linked Devices → Link a Device');
-      console.log('3. Choose "Link with phone number instead"');
-      console.log(`4. Enter this code: ${code}`);
-      console.log('\n✅ Bot will automatically connect after pairing!\n');
-    } catch (error) {
-      console.error('❌ Error getting pairing code:', error.message);
-      console.log('⚠️ Falling back to QR code...');
-      // If pairing fails, QR will still work since printQRInTerminal is false,
-      // but we need to enable it temporarily
-      // This is a fallback - will show QR if pairing fails
-      const fallbackSock = makeWASocket({
-        version,
-        logger: suppressedLogger,
-        printQRInTerminal: true, // Enable QR as fallback
-        browser: ['Chrome', 'Windows', '10.0'],
-        auth: state,
-        syncFullHistory: false,
-        downloadHistory: false,
-        markOnlineOnConnect: false,
-        getMessage: async () => undefined
-      });
-      // Replace sock with fallback
-      Object.assign(sock, fallbackSock);
-      console.log('📱 Please scan the QR code that will appear below:');
-    }
-  }
 
   // Bind store to socket
   store.bind(sock.ev);
 
-  // Watchdog for inactive socket (Baileys bug fix)
+  // Watchdog for inactive socket
   let lastActivity = Date.now();
-  const INACTIVITY_TIMEOUT = 30 * 60 * 1000; // 30 minutes
+  const INACTIVITY_TIMEOUT = 30 * 60 * 1000;
 
-  // Update on every message
   sock.ev.on('messages.upsert', () => {
     lastActivity = Date.now();
   });
 
-  // Check every 5 min
   const watchdogInterval = setInterval(async () => {
-    if (Date.now() - lastActivity > INACTIVITY_TIMEOUT && sock.ws.readyState === 1) { // WebSocket open but inactive
+    if (Date.now() - lastActivity > INACTIVITY_TIMEOUT && sock.ws?.readyState === 1) {
       console.log('⚠️ No activity detected. Forcing reconnect...');
       await sock.end(undefined, undefined, { reason: 'inactive' });
       clearInterval(watchdogInterval);
-      setTimeout(() => startBot(), 5000); // Slightly longer delay
+      setTimeout(() => startBot(), 5000);
     }
-  }, 5 * 60 * 1000); // Every 5 min check
+  }, 5 * 60 * 1000);
 
-  // Clear on close/open
-  sock.ev.on('connection.update', (update) => {
-    const { connection } = update;
-    if (connection === 'open') {
-      lastActivity = Date.now(); // Reset on open
-    } else if (connection === 'close') {
-      clearInterval(watchdogInterval);
-    }
-  });
-
-  // Connection update handler
+  // Connection update handler - PAIRING CODE REQUEST MOVED HERE
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // Only show QR if it's generated (fallback mode)
-    if (qr && !state.creds.registered) {
-      console.log('\n\n📱 Scan this QR code with WhatsApp:\n');
-      qrcode.generate(qr, { small: true });
-    }
-
-    if (connection === 'close') {
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const errorMessage = lastDisconnect?.error?.message || 'Unknown error';
-
-      // Suppress verbose error output for common stream errors (515, etc.)
-      if (statusCode === 515 || statusCode === 503 || statusCode === 408) {
-        console.log(`⚠️ Connection closed (${statusCode}). Reconnecting...`);
-      } else {
-        console.log('Connection closed due to:', errorMessage, '\nReconnecting:', shouldReconnect);
-      }
-
-      if (shouldReconnect) {
-        setTimeout(() => startBot(), 3000);
-      }
-    } else if (connection === 'open') {
+    // ✅ REQUEST PAIRING CODE WHEN CONNECTION IS OPEN
+    if (connection === 'open') {
       console.log('\n✅ Bot connected successfully!');
       console.log(`📱 Bot Number: ${sock.user.id.split(':')[0]}`);
       console.log(`🤖 Bot Name: ${config.botName}`);
@@ -346,30 +271,74 @@ async function startBot() {
       console.log(`👑 Owner: ${ownerNames}\n`);
       console.log('Bot is ready to receive messages!\n');
 
-      // Set bot status
       if (config.autoBio) {
         await sock.updateProfileStatus(`${config.botName} | Active 24/7`);
       }
 
-      // Initialize anti-call feature
       handler.initializeAntiCall(sock);
 
-      // Cleanup old chats (keep only active ones, e.g., last touched <1 day)
+      // Cleanup old chats
       const now = Date.now();
       for (const [jid, chatMsgs] of store.messages.entries()) {
         const timestamps = Array.from(chatMsgs.values()).map(m => m.messageTimestamp * 1000 || 0);
-        if (timestamps.length > 0 && now - Math.max(...timestamps) > 24 * 60 * 60 * 1000) { // 1 day old chat
+        if (timestamps.length > 0 && now - Math.max(...timestamps) > 24 * 60 * 60 * 1000) {
           store.messages.delete(jid);
         }
       }
       console.log(`🧹 Store cleaned. Active chats: ${store.messages.size}`);
+
+      // ✅ PAIRING CODE - REQUEST HERE (ONLY IF NOT REGISTERED)
+      if (!state.creds.registered) {
+        console.log('\n📱 Requesting pairing code...');
+        const phoneNumber = process.env.OWNER_NUMBER || config.ownerNumber || '6281234567890';
+        
+        try {
+          const code = await sock.requestPairingCode(phoneNumber);
+          console.log('\n🔐 ========================================');
+          console.log(`🔐 YOUR PAIRING CODE: ${code}`);
+          console.log('🔐 ========================================');
+          console.log('\n📲 To link your WhatsApp:');
+          console.log('1. Open WhatsApp on your phone');
+          console.log('2. Go to Settings → Linked Devices → Link a Device');
+          console.log('3. Choose "Link with phone number instead"');
+          console.log(`4. Enter this code: ${code}`);
+          console.log('\n✅ Bot will automatically connect after pairing!\n');
+        } catch (error) {
+          console.error('❌ Error getting pairing code:', error.message);
+          console.log('⚠️ Please scan the QR code below instead:\n');
+          // QR will be shown by the qr event below
+        }
+      }
+    }
+
+    // Show QR code (as fallback)
+    if (qr && !state.creds.registered) {
+      console.log('\n📱 Scan this QR code with WhatsApp:\n');
+      qrcode.generate(qr, { small: true });
+    }
+
+    if (connection === 'close') {
+      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const errorMessage = lastDisconnect?.error?.message || 'Unknown error';
+
+      if (statusCode === 515 || statusCode === 503 || statusCode === 408) {
+        console.log(`⚠️ Connection closed (${statusCode}). Reconnecting...`);
+      } else {
+        console.log('Connection closed due to:', errorMessage, '\nReconnecting:', shouldReconnect);
+      }
+
+      if (shouldReconnect) {
+        clearInterval(watchdogInterval);
+        setTimeout(() => startBot(), 3000);
+      }
     }
   });
 
   // Credentials update handler
   sock.ev.on('creds.update', saveCreds);
 
-  // System JID filter - checks if JID is from broadcast/status/newsletter
+  // System JID filter
   const isSystemJid = (jid) => {
     if (!jid) return true;
     return jid.includes('@broadcast') ||
@@ -378,46 +347,26 @@ async function startBot() {
       jid.includes('@newsletter.');
   };
 
-  // Messages handler - Process only new messages
+  // Messages handler
   sock.ev.on('messages.upsert', ({ messages, type }) => {
-    // Only process "notify" type (new messages), skip "append" (old messages from history)
     if (type !== 'notify') return;
 
-    // Process messages in the array
     for (const msg of messages) {
-      // Skip if message is invalid or missing key
       if (!msg.message || !msg.key?.id) continue;
 
       const from = msg.key.remoteJid;
-      if (!from) {
-        continue;
-      }
+      if (!from || isSystemJid(from)) continue;
 
-      // System message filter - ignore broadcast/status/newsletter messages
-      if (isSystemJid(from)) {
-        continue; // Silently ignore system messages
-      }
-
-      // Deduplication: Skip if message has already been processed
       const msgId = msg.key.id;
       if (processedMessages.has(msgId)) continue;
 
-      // Timestamp validation: Only process messages within last 5 minutes
-      const MESSAGE_AGE_LIMIT = 5 * 60 * 1000; // 5 minutes in milliseconds
-      let messageAge = 0;
       if (msg.messageTimestamp) {
-        messageAge = Date.now() - (msg.messageTimestamp * 1000);
-        if (messageAge > MESSAGE_AGE_LIMIT) {
-          // Message is too old, skip processing
-          continue;
-        }
+        const messageAge = Date.now() - (msg.messageTimestamp * 1000);
+        if (messageAge > 5 * 60 * 1000) continue;
       }
 
-      // Mark message as processed
       processedMessages.add(msgId);
 
-      // Store message FIRST (before processing)
-      // from already defined above in DM block check
       if (msg.key && msg.key.id) {
         if (!store.messages.has(from)) {
           store.messages.set(from, new Map());
@@ -425,9 +374,7 @@ async function startBot() {
         const chatMsgs = store.messages.get(from);
         chatMsgs.set(msg.key.id, msg);
 
-        // Cleanup: Keep only last 20 per chat (reduced from 200)
         if (chatMsgs.size > store.maxPerChat) {
-          // Remove oldest messages
           const sortedIds = Array.from(chatMsgs.entries())
             .sort((a, b) => (a[1].messageTimestamp || 0) - (b[1].messageTimestamp || 0))
             .map(([id]) => id);
@@ -437,7 +384,6 @@ async function startBot() {
         }
       }
 
-      // Process command IMMEDIATELY (don't block on other operations)
       handler.handleMessage(sock, msg).catch(err => {
         if (!err.message?.includes('rate-overlimit') &&
           !err.message?.includes('not-authorized')) {
@@ -445,14 +391,11 @@ async function startBot() {
         }
       });
 
-      // Do other operations in background (non-blocking)
       setImmediate(async () => {
         if (config.autoRead && from.endsWith('@g.us')) {
           try {
             await sock.readMessages([msg.key]);
-          } catch (e) {
-            // Silently handle
-          }
+          } catch (e) {}
         }
         if (from.endsWith('@g.us')) {
           try {
@@ -460,35 +403,22 @@ async function startBot() {
             if (groupMetadata) {
               await handler.handleAntilink(sock, msg, groupMetadata);
             }
-          } catch (error) {
-            // Silently handle
-          }
+          } catch (error) {}
         }
       });
     }
   });
 
-  // Message receipt updates (silently handled, no logging)
-  sock.ev.on('message-receipt.update', () => {
-    // Silently handle receipt updates
-  });
+  sock.ev.on('message-receipt.update', () => {});
+  sock.ev.on('messages.update', () => {});
 
-  // Message updates (silently handled, no logging)
-  sock.ev.on('messages.update', () => {
-    // Silently handle message updates
-  });
-
-  // Group participant updates (join/leave)
   sock.ev.on('group-participants.update', async (update) => {
     await handler.handleGroupUpdate(sock, update);
   });
 
-  // Handle errors - suppress common stream errors
   sock.ev.on('error', (error) => {
     const statusCode = error?.output?.statusCode;
-    // Suppress verbose output for common stream errors
     if (statusCode === 515 || statusCode === 503 || statusCode === 408) {
-      // These are usually temporary connection issues, handled by reconnection
       return;
     }
     console.error('Socket error:', error.message || error);
@@ -496,6 +426,7 @@ async function startBot() {
 
   return sock;
 }
+
 // Start the bot
 console.log('🚀 Starting WhatsApp MD Bot...\n');
 console.log(`📦 Bot Name: ${config.botName}`);
@@ -503,41 +434,37 @@ console.log(`⚡ Prefix: ${config.prefix}`);
 const ownerNames = Array.isArray(config.ownerName) ? config.ownerName.join(',') : config.ownerName;
 console.log(`👑 Owner: ${ownerNames}\n`);
 
-// Proactively delete Puppeteer cache so it doesn't fill disk on panels
 cleanupPuppeteerCache();
 
 startBot().catch(err => {
   console.error('Error starting bot:', err);
   process.exit(1);
 });
-// Handle process termination
+
 process.on('uncaughtException', (err) => {
-  // Handle ENOSPC errors gracefully without crashing
   if (err.code === 'ENOSPC' || err.errno === -28 || err.message?.includes('no space left on device')) {
     console.error('⚠️ ENOSPC Error: No space left on device. Attempting cleanup...');
     const { cleanupOldFiles } = require('./utils/cleanup');
     cleanupOldFiles();
     console.warn('⚠️ Cleanup completed. Bot will continue but may experience issues until space is freed.');
-    return; // Don't crash, just log and continue
+    return;
   }
   console.error('Uncaught Exception:', err);
 });
+
 process.on('unhandledRejection', (err) => {
-  // Handle ENOSPC errors gracefully
   if (err.code === 'ENOSPC' || err.errno === -28 || err.message?.includes('no space left on device')) {
     console.warn('⚠️ ENOSPC Error in promise: No space left on device. Attempting cleanup...');
     const { cleanupOldFiles } = require('./utils/cleanup');
     cleanupOldFiles();
     console.warn('⚠️ Cleanup completed. Bot will continue but may experience issues until space is freed.');
-    return; // Don't crash, just log and continue
+    return;
   }
-
-  // Don't spam console with rate limit errors
   if (err.message && err.message.includes('rate-overlimit')) {
     console.warn('⚠️ Rate limit reached. Please slow down your requests.');
     return;
   }
   console.error('Unhandled Rejection:', err);
 });
-// Export store for use in commands
+
 module.exports = { store };
