@@ -228,7 +228,7 @@ async function startBot() {
   const sock = makeWASocket({
     version, // explicit WA Web version negotiated with the server
     logger: suppressedLogger,
-    printQRInTerminal: false,
+    printQRInTerminal: false, // ✅ DISABLED QR - PAIRING CODE ONLY
     // Use a common desktop browser signature
     browser: ['Chrome', 'Windows', '10.0'],
     auth: state,
@@ -238,6 +238,47 @@ async function startBot() {
     markOnlineOnConnect: false,
     getMessage: async () => undefined // Don't load messages from store
   });
+
+  // ✅ PAIRING CODE LOGIC - ADDED HERE
+  // Request pairing code if not registered yet
+  if (!state.creds.registered) {
+    console.log('\n📱 Requesting pairing code...');
+    // Get phone number from environment variable or config
+    const phoneNumber = process.env.OWNER_NUMBER || config.ownerNumber || '6281234567890';
+    
+    try {
+      const code = await sock.requestPairingCode(phoneNumber);
+      console.log('\n🔐 ========================================');
+      console.log(`🔐 YOUR PAIRING CODE: ${code}`);
+      console.log('🔐 ========================================');
+      console.log('\n📲 To link your WhatsApp:');
+      console.log('1. Open WhatsApp on your phone');
+      console.log('2. Go to Settings → Linked Devices → Link a Device');
+      console.log('3. Choose "Link with phone number instead"');
+      console.log(`4. Enter this code: ${code}`);
+      console.log('\n✅ Bot will automatically connect after pairing!\n');
+    } catch (error) {
+      console.error('❌ Error getting pairing code:', error.message);
+      console.log('⚠️ Falling back to QR code...');
+      // If pairing fails, QR will still work since printQRInTerminal is false,
+      // but we need to enable it temporarily
+      // This is a fallback - will show QR if pairing fails
+      const fallbackSock = makeWASocket({
+        version,
+        logger: suppressedLogger,
+        printQRInTerminal: true, // Enable QR as fallback
+        browser: ['Chrome', 'Windows', '10.0'],
+        auth: state,
+        syncFullHistory: false,
+        downloadHistory: false,
+        markOnlineOnConnect: false,
+        getMessage: async () => undefined
+      });
+      // Replace sock with fallback
+      Object.assign(sock, fallbackSock);
+      console.log('📱 Please scan the QR code that will appear below:');
+    }
+  }
 
   // Bind store to socket
   store.bind(sock.ev);
@@ -275,7 +316,8 @@ async function startBot() {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    if (qr) {
+    // Only show QR if it's generated (fallback mode)
+    if (qr && !state.creds.registered) {
       console.log('\n\n📱 Scan this QR code with WhatsApp:\n');
       qrcode.generate(qr, { small: true });
     }
