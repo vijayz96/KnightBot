@@ -290,7 +290,7 @@ async function startBot() {
       // ✅ PAIRING CODE - REQUEST HERE (ONLY IF NOT REGISTERED)
       if (!state.creds.registered) {
         console.log('\n📱 Requesting pairing code...');
-        const phoneNumber = process.env.OWNER_NUMBER || config.ownerNumber || '6281234567890';
+        const phoneNumber = process.env.OWNER_NUMBER || config.ownerNumber || '918589822129';
         
         try {
           const code = await sock.requestPairingCode(phoneNumber);
